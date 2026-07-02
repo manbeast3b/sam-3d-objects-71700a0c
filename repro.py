@@ -48,18 +48,107 @@ def _gpu_mem_mb():
     return None
 
 
+def _env_info():
+    info = {}
+    try:
+        import torch
+        info["torch"] = torch.__version__
+        info["cuda"] = torch.version.cuda
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            info["gpu"] = torch.cuda.get_device_name(0)
+    except Exception as e:
+        info["torch_error"] = repr(e)
+    return info
+
+
+def _seed_everything(seed):
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+REQUIRED_CKPTS = [
+    "pipeline.yaml", "ss_generator.ckpt", "slat_generator.ckpt",
+    "ss_decoder.ckpt", "slat_decoder_gs.ckpt", "slat_decoder_mesh.ckpt",
+]
+
+
+def selfcheck(tag):
+    """Fast preflight: validate inputs, checkpoints, and heavy imports BEFORE
+    paying for the (slow) model load. Returns a report dict; exits non-zero on
+    any hard failure so a broken run dies in seconds, not after a 10-min load."""
+    report = {"mode": "selfcheck", "checks": {}, "env": _env_info()}
+    hard_fail = []
+
+    def check(name, ok, detail=""):
+        report["checks"][name] = {"ok": bool(ok), "detail": detail}
+        if not ok:
+            hard_fail.append(f"{name}: {detail}")
+
+    check("sample_image", os.path.exists(SAMPLE_IMAGE), SAMPLE_IMAGE)
+    primary_mask = os.path.join(SAMPLE_DIR, f"{PRIMARY_MASK_INDEX}.png")
+    check("primary_mask", os.path.exists(primary_mask), primary_mask)
+
+    ckpt_dir = f"checkpoints/{tag}"
+    for f in REQUIRED_CKPTS:
+        p = os.path.join(ckpt_dir, f)
+        sz = os.path.getsize(p) if os.path.exists(p) else 0
+        check(f"ckpt:{f}", sz > 0, f"{p} ({sz} bytes)")
+
+    # Heavy imports are the #1 real failure (extension builds). Import them here
+    # so selfcheck alone surfaces a broken pytorch3d/kaolin/gsplat build.
+    for mod in ["torch", "pytorch3d", "kaolin", "gsplat"]:
+        try:
+            __import__(mod)
+            check(f"import:{mod}", True)
+        except Exception as e:
+            check(f"import:{mod}", False, f"{type(e).__name__}: {e}")
+
+    try:
+        import inference  # noqa: F401  (notebook/inference.py; validates its imports)
+        check("import:inference_module", True)
+    except Exception as e:
+        check("import:inference_module", False, f"{type(e).__name__}: {e}")
+
+    report["status"] = "success" if not hard_fail else "failed"
+    report["failures"] = hard_fail
+    with open(os.path.join(ARTIFACTS, "selfcheck.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    print("SELFCHECK", json.dumps(report))
+    if hard_fail:
+        sys.exit(2)
+    return report
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--product", required=True,
-                    choices=["gs", "mesh", "scene", "stage1", "layout"])
+    ap.add_argument("--product", choices=["gs", "mesh", "scene", "stage1", "layout"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tag", default="hf")
+    ap.add_argument("--selfcheck", action="store_true",
+                    help="Validate inputs/checkpoints/imports and exit (no inference).")
     args = ap.parse_args()
+
+    if args.selfcheck:
+        selfcheck(args.tag)
+        return
+    if not args.product:
+        ap.error("--product is required unless --selfcheck is given")
 
     metrics = {
         "product": args.product,
         "seed": args.seed,
         "status": "started",
+        "env": _env_info(),
     }
     t_all = _now()
 
@@ -67,7 +156,12 @@ def main():
         Inference, load_image, load_single_mask, load_masks, make_scene,
     )
 
+    _seed_everything(args.seed)
+
     config_path = f"checkpoints/{args.tag}/pipeline.yaml"
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"{config_path} not found; run checkpoint download (Stage 5) first")
     t0 = _now()
     inference = Inference(config_path, compile=False)
     metrics["load_seconds"] = round(_now() - t0, 2)
@@ -118,8 +212,21 @@ def main():
         masks = load_masks(SAMPLE_DIR, extension=".png")
         metrics["num_objects"] = len(masks)
         t0 = _now()
-        outputs = [inference(image, m, seed=args.seed) for m in masks]
+        # Reconstruct each object; skip (don't abort) any single failure so one
+        # hard mask can't kill the whole 27-object scene run.
+        outputs, failed = [], []
+        for i, m in enumerate(masks):
+            try:
+                outputs.append(inference(image, m, seed=args.seed))
+            except Exception as e:
+                failed.append({"index": i, "error": f"{type(e).__name__}: {e}"})
         metrics["infer_seconds"] = round(_now() - t0, 2)
+        metrics["num_objects_ok"] = len(outputs)
+        metrics["num_objects_failed"] = len(failed)
+        if failed:
+            metrics["failed_objects"] = failed
+        if not outputs:
+            raise RuntimeError("scene: every object reconstruction failed")
         scene_gs = make_scene(*outputs)
         metrics["num_gaussians"] = int(scene_gs.get_xyz.shape[0])
         path = "scene.ply"
@@ -135,7 +242,13 @@ def main():
         )
         metrics["infer_seconds"] = round(_now() - t0, 2)
         import numpy as np
-        voxel = output["voxel"]
+        # stage1_only returns "voxel" ([N,3] coords); fall back to raw "coords".
+        voxel = output.get("voxel")
+        if voxel is None and "coords" in output:
+            c = output["coords"]
+            voxel = c[:, 1:] if hasattr(c, "__getitem__") else c
+        if voxel is None:
+            raise KeyError("stage1: neither 'voxel' nor 'coords' in output")
         try:
             voxel_np = voxel.detach().cpu().numpy()
         except Exception:
