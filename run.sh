@@ -146,10 +146,19 @@ pip install --no-cache-dir 'huggingface-hub[cli]<1.0' 2>&1 | tail -3 | tee -a "$
 HF_REPO="${HF_REPO:-jetjodh/sam-3d-objects}"
 TAG=hf
 if [ ! -f "checkpoints/${TAG}/pipeline.yaml" ]; then
-  rm -rf "checkpoints/${TAG}-download"
-  hf download --repo-type model --local-dir "checkpoints/${TAG}-download" \
-    --max-workers 2 "$HF_REPO" 2>&1 | tail -12 | tee -a "$EVAL" \
-    || fail "checkpoint download from $HF_REPO failed"
+  # `hf download` is resumable: it re-uses the local dir cache, so a retry after
+  # a dropped connection continues rather than restarting the 12GB pull.
+  ok=0
+  for attempt in 1 2 3; do
+    log "checkpoint download attempt $attempt"
+    if hf download --repo-type model --local-dir "checkpoints/${TAG}-download" \
+        --max-workers 2 "$HF_REPO" 2>&1 | tail -12 | tee -a "$EVAL"; then
+      ok=1; break
+    fi
+    log "download attempt $attempt failed; retrying in 10s"
+    sleep 10
+  done
+  [ "$ok" -eq 1 ] || fail "checkpoint download from $HF_REPO failed after 3 attempts"
   if [ -d "checkpoints/${TAG}-download/checkpoints" ]; then
     mv "checkpoints/${TAG}-download/checkpoints" "checkpoints/${TAG}"
   else
@@ -158,9 +167,11 @@ if [ ! -f "checkpoints/${TAG}/pipeline.yaml" ]; then
   fi
   rm -rf "checkpoints/${TAG}-download"
 fi
-[ -f "checkpoints/${TAG}/pipeline.yaml" ] || fail "pipeline.yaml missing after download"
-[ -s "checkpoints/${TAG}/ss_generator.ckpt" ] || fail "ss_generator.ckpt missing/empty"
-[ -s "checkpoints/${TAG}/slat_generator.ckpt" ] || fail "slat_generator.ckpt missing/empty"
+# Verify every checkpoint the pipeline actually loads is present and non-empty.
+for req in pipeline.yaml ss_generator.ckpt slat_generator.ckpt ss_decoder.ckpt \
+           slat_decoder_gs.ckpt slat_decoder_mesh.ckpt; do
+  [ -s "checkpoints/${TAG}/$req" ] || fail "required checkpoint missing/empty: $req"
+done
 log "checkpoint files:"
 ls -la "checkpoints/${TAG}" | tee -a "$EVAL"
 
@@ -170,6 +181,15 @@ ls -la "checkpoints/${TAG}" | tee -a "$EVAL"
 PRODUCT="gs"
 [ -f product.env ] && PRODUCT="$(tr -d '[:space:]' < product.env)"
 log "PRODUCT=$PRODUCT"
+
+section "Stage 5b: preflight self-check (fail fast before the slow model load)"
+# Validates sample inputs, checkpoint files, and that the heavy extension
+# modules (pytorch3d/kaolin/gsplat) + notebook inference module actually import.
+# Exits non-zero here in seconds if the env is broken, instead of after a
+# multi-minute model load inside the product run.
+python repro.py --selfcheck 2>&1 | tee -a "$EVAL"
+sc_rc="${PIPESTATUS[0]:-1}"
+[ "$sc_rc" -eq 0 ] || fail "preflight self-check failed (see selfcheck.json / above)"
 
 section "Stage 6: run repro harness (product=$PRODUCT)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1 | tee -a "$EVAL" || true
