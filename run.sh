@@ -39,9 +39,10 @@ fail() {
 }
 
 {
-  echo "# SAM 3D Objects — Minimal Reproduction"
+  echo "# SAM 3D Objects — Reproduction Harness"
   echo
-  echo "Core claim: reconstruct a full 3D model (gaussian splat) from a single image + mask."
+  echo "Core claim: reconstruct full 3D (geometry, texture, layout) from a single image + mask."
+  echo "This run reproduces one of the model's product/output modes (see product.env)."
 } >> "$EVAL"
 
 # ---------------------------------------------------------------------------
@@ -164,41 +165,51 @@ log "checkpoint files:"
 ls -la "checkpoints/${TAG}" | tee -a "$EVAL"
 
 # ---------------------------------------------------------------------------
-section "Stage 6: run demo.py (single image -> 3D gaussian splat)"
+# Which "product" (output mode) this variant reproduces. Variants differ ONLY
+# in product.env; the run command (bash run.sh) is identical across the tree.
+PRODUCT="gs"
+[ -f product.env ] && PRODUCT="$(tr -d '[:space:]' < product.env)"
+log "PRODUCT=$PRODUCT"
+
+section "Stage 6: run repro harness (product=$PRODUCT)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1 | tee -a "$EVAL" || true
-python demo.py 2>&1 | tee -a "$EVAL"
+python repro.py --product "$PRODUCT" --seed 42 2>&1 | tee -a "$EVAL"
 demo_rc="${PIPESTATUS[0]:-1}"
 
 # ---------------------------------------------------------------------------
 section "Stage 7: results"
+MJSON=".openresearch/artifacts/metrics.json"
 {
   echo
-  echo "## Result"
+  echo "## Result — product: $PRODUCT"
   echo
-  if [ "$demo_rc" -eq 0 ] && [ -s splat.ply ]; then
-    SIZE=$(stat -c %s splat.ply)
-    N_LINES=$(grep -c . splat.ply 2>/dev/null || echo "?")
+  if [ "$demo_rc" -eq 0 ] && [ -f "$MJSON" ] && grep -q '"status": "success"' "$MJSON"; then
     echo "- **Status:** SUCCESS"
-    echo "- **Output:** \`splat.ply\` (${SIZE} bytes)"
-    echo "- Reconstructed a 3D gaussian splat from a single RGB image (kidsroom, object index 14) with the pretrained SAM 3D Objects pipeline — full geometry + texture from one view."
-    # Save a copy of the splat as an artifact for later inspection.
-    cp splat.ply .openresearch/artifacts/splat.ply 2>/dev/null || true
+    echo
+    echo '```json'
+    cat "$MJSON"
+    echo '```'
   else
-    echo "- **Status:** FAILED (demo exit=$demo_rc, splat.ply present=$( [ -s splat.ply ] && echo yes || echo no ))"
+    echo "- **Status:** FAILED (harness exit=$demo_rc)"
+    if [ -f "$MJSON" ]; then
+      echo
+      echo '```json'
+      cat "$MJSON"
+      echo '```'
+    fi
   fi
   echo
   echo "## Setup"
   echo
-  echo "- **Entrypoint:** \`python demo.py\` → loads \`checkpoints/hf/pipeline.yaml\`, runs the full inference pipeline (MoGe pointmap → sparse-structure sample → SLAT sample → gaussian/mesh decode) on one image+mask, saves \`splat.ply\`."
-  echo "- **Env:** Miniforge conda env from \`environments/default.yml\` (CUDA 12.1 toolkit, gcc 12.4) + torch 2.5.1+cu121 + \`pip install -e '.[dev,p3d,inference]'\` (pytorch3d, flash-attn, kaolin, gsplat) + hydra 1.3.2 patch."
+  echo "- **Entrypoint:** \`python repro.py --product $PRODUCT\` → loads \`checkpoints/hf/pipeline.yaml\`, runs MoGe pointmap → sparse-structure sample → SLAT sample → decode, and writes the product artifact + \`metrics.json\`."
+  echo "- **Products:** gs (splat), mesh (textured GLB), scene (multi-object posed), stage1 (coarse voxels), layout (posed R,t,s). Selected via \`product.env\`."
+  echo "- **Env:** Miniforge conda env from \`environments/default.yml\` (CUDA 12.1, gcc 12.4) + torch 2.5.1+cu121 + \`pip install -e '.[dev,p3d,inference]'\` + hydra 1.3.2 patch."
   echo "- **Checkpoints:** \`$HF_REPO\` (public ungated mirror of \`facebook/sam-3d-objects\`)."
-  echo "- **Compute:** single GPU, >=32GB VRAM (launched on H100_SXM)."
-  echo
-  echo "This is the smallest configuration that demonstrates the paper's central mechanism end to end: single-image 3D reconstruction of an arbitrary masked object into full 3D geometry and texture."
+  echo "- **Compute:** single GPU, >=32GB VRAM (H100_SXM)."
 } >> "$EVAL"
 
-if [ "$demo_rc" -ne 0 ] || [ ! -s splat.ply ]; then
-  log "demo failed or produced no splat"
+if [ "$demo_rc" -ne 0 ]; then
+  log "harness failed for product=$PRODUCT"
   exit 1
 fi
-log "done — splat.ply produced successfully"
+log "done — product=$PRODUCT produced successfully"
