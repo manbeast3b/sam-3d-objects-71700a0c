@@ -170,6 +170,15 @@ def main():
     image = load_image(SAMPLE_IMAGE)
     metrics["image_hw"] = list(image.shape[:2])
 
+    # Canonical RGBA encoding. Inference.__call__ embeds the mask into the alpha
+    # channel as 0/255 (merge_mask_to_rgba) and then calls pipe.run(rgba, None).
+    # Calling pipe.run(image, raw_mask) instead would embed a 0/1 boolean alpha
+    # (merge_image_and_mask), which is NOT the same encoding the reference path
+    # uses. To keep all products consistent and reference-accurate, every product
+    # builds the RGBA the same way and passes mask=None to pipe.run.
+    def rgba_for(mask):
+        return inference.merge_mask_to_rgba(image, mask)
+
     out_files = {}
 
     if args.product == "gs":
@@ -189,7 +198,7 @@ def main():
         t0 = _now()
         # Full mesh path: mesh postprocess + texture baking produce a GLB.
         output = pipe.run(
-            image, mask, args.seed,
+            rgba_for(mask), None, args.seed,
             stage1_only=False,
             with_mesh_postprocess=True,
             with_texture_baking=True,
@@ -237,7 +246,7 @@ def main():
         mask = load_single_mask(SAMPLE_DIR, index=PRIMARY_MASK_INDEX)
         t0 = _now()
         output = pipe.run(
-            image, mask, args.seed,
+            rgba_for(mask), None, args.seed,
             stage1_only=True,  # coarse sparse-structure only: fast, cheap
         )
         metrics["infer_seconds"] = round(_now() - t0, 2)
@@ -262,7 +271,7 @@ def main():
         mask = load_single_mask(SAMPLE_DIR, index=PRIMARY_MASK_INDEX)
         t0 = _now()
         output = pipe.run(
-            image, mask, args.seed,
+            rgba_for(mask), None, args.seed,
             stage1_only=False,
             with_mesh_postprocess=False,
             with_texture_baking=False,
