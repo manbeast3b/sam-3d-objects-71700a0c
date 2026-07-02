@@ -45,15 +45,17 @@ pip install -e '.[inference]' 2>&1 | tail -5 | tee -a "$EVAL"
 echo "[run] === Stage 4: patch hydra ===" | tee -a "$EVAL"
 ./patching/hydra 2>&1 | tail -5 | tee -a "$EVAL" || echo "[run] hydra patch step returned non-zero (continuing)" | tee -a "$EVAL"
 
-echo "[run] === Stage 5: download checkpoints from HF ===" | tee -a "$EVAL"
+echo "[run] === Stage 5: download checkpoints from HF (public mirror) ===" | tee -a "$EVAL"
 pip install 'huggingface-hub[cli]<1.0' 'hf_transfer' 2>&1 | tail -3 | tee -a "$EVAL"
+# Public, ungated mirror of facebook/sam-3d-objects checkpoints (no token needed).
+HF_REPO="jetjodh/sam-3d-objects"
 TAG=hf
-if [ ! -d "checkpoints/${TAG}/pipeline.yaml" ] && [ ! -f "checkpoints/${TAG}/pipeline.yaml" ]; then
-  hf download --repo-type model --local-dir "checkpoints/${TAG}-download" --max-workers 1 facebook/sam-3d-objects 2>&1 | tail -10 | tee -a "$EVAL"
+if [ ! -f "checkpoints/${TAG}/pipeline.yaml" ]; then
+  hf download --repo-type model --local-dir "checkpoints/${TAG}-download" --max-workers 1 "$HF_REPO" 2>&1 | tail -10 | tee -a "$EVAL"
   mv "checkpoints/${TAG}-download/checkpoints" "checkpoints/${TAG}"
   rm -rf "checkpoints/${TAG}-download"
 fi
-ls -la "checkpoints/${TAG}" | head -20 | tee -a "$EVAL"
+ls -la "checkpoints/${TAG}" | head -30 | tee -a "$EVAL"
 
 echo "[run] === Stage 6: run demo.py ===" | tee -a "$EVAL"
 python demo.py 2>&1 | tee -a "$EVAL"
